@@ -6,8 +6,8 @@ from scipy.optimize import curve_fit
 # ==============================
 # USER SETTINGS
 # ==============================
-FILE_PATH = "GaN_68K_200ms_Start.csv"  # <-- change this
-X_COLUMN = "Wavelength_nm"                 # or "Wavelength_nm"
+FILE_PATH = "./TestCode/PeakFitting/GaN_68K_200ms_Start.csv"  # <-- change this
+X_COLUMN = "Energy_eV"                 # or "Wavelength_nm"
 Y_COLUMN = "Counts"
 
 # ==============================
@@ -80,7 +80,7 @@ def compute_error_and_grads(y, A, sigma):
     return E, dE_dA, dE_dsigma
 
 
-def estimate_Tmax(y, E_max_factor=1e-4, p_A=0.1, p_sigma=0.1, alpha=0.3, max_iter=2000, rng=None):
+def estimate_Tmax(y, E_max_factor=1e-4, p_A=0.1, p_sigma=0.1, alpha=0.3, max_iter=2000, rng=None, verbose=False):
     """
     Roughly estimate T_max as in Hu et al.
     """
@@ -100,7 +100,12 @@ def estimate_Tmax(y, E_max_factor=1e-4, p_A=0.1, p_sigma=0.1, alpha=0.3, max_ite
     t = 0
     while t < max_iter:
         E, dE_dA, dE_dsigma = compute_error_and_grads(y, A, sigma)
+
+        if verbose and t % 50 == 0:
+            print(f"[estimate_Tmax] Iter {t}: E = {E:.4e}, target = {E_max:.4e}")
         if E <= E_max:
+            if verbose:
+                print(f"[estimate_Tmax] reached E_max at iter {t}")
             break
 
         # gradient + inertia
@@ -116,19 +121,20 @@ def estimate_Tmax(y, E_max_factor=1e-4, p_A=0.1, p_sigma=0.1, alpha=0.3, max_ite
         t += 1
 
     T_max = max(3 * t, 50)  # minimum safety
+
+    if verbose:
+            print(f"[estimate_Tmax] final t={t}, T_max={T_max}")
+
     return T_max
 
 
-def extract_peaks_for_r(y, T_max, r, p_A=0.05, p_sigma=0.05, alpha=0.3, k1=2.0, k2=2.0, rng=None):
-    """
-    Stage 2: for a given MIS r, use Hu's peak extraction to find candidate
-    peak positions (indices where A_i > 0 at the end).
-    """
+def extract_peaks_for_r(y, T_max, r,
+                        p_A=0.05, p_sigma=0.05, alpha=0.3,
+                        k1=2.0, k2=2.0, rng=None, verbose=False):
     n = len(y)
     if rng is None:
         rng = np.random.default_rng(0)
 
-    # Start from random A and narrow widths
     A = rng.random(n)
     sigma = np.full(n, 2.0)
 
@@ -141,6 +147,12 @@ def extract_peaks_for_r(y, T_max, r, p_A=0.05, p_sigma=0.05, alpha=0.3, k1=2.0, 
     for t in range(1, T_max1 + 1):
         E, dE_dA, dE_dsigma = compute_error_and_grads(y, A, sigma)
 
+        if verbose and t % 20 == 0:
+            # quick summary of how many nonzero A's remain
+            nz = np.count_nonzero(A > 0)
+            print(f"[extract_peaks_for_r] r={r}, t={t}/{T_max1}, "
+                  f"E={E:.4e}, nonzero A={nz}")
+
         dA = -p_A * dE_dA + alpha * dA
         dsigma = -p_sigma * dE_dsigma + alpha * dsigma
 
@@ -150,7 +162,6 @@ def extract_peaks_for_r(y, T_max, r, p_A=0.05, p_sigma=0.05, alpha=0.3, k1=2.0, 
         A = np.clip(A, 0, None)
         sigma = np.clip(sigma, 1e-3, n / 2)
 
-        # Peak suppression based on local maxima and time-dependent thresholds
         kk1 = np.exp(-k1 * (1 - t / T_max1))
         kk2 = np.exp(-k2 * (1 - t / T_max1))
         radius = int(max(1, r * kk1))
@@ -168,7 +179,10 @@ def extract_peaks_for_r(y, T_max, r, p_A=0.05, p_sigma=0.05, alpha=0.3, k1=2.0, 
         A = A_new
 
     peak_indices = np.where(A > 0)[0]
+    if verbose:
+        print(f"[extract_peaks_for_r] r={r} finished, peaks found={len(peak_indices)}")
     return peak_indices
+
 
 
 def cluster_peak_indices(indices, min_gap):
@@ -244,12 +258,7 @@ def refine_with_curve_fit(x, y, peak_centers_idx, amp_guess_factor=1.0, width_gu
 # ==============================
 # WRAPPER: FULL HU-STYLE WORKFLOW
 # ==============================
-def hu_deconvolve_PL(x, y, r_values=None, rng=None):
-    """
-    Full Hu-style deconvolution on one PL spectrum.
-    Returns:
-      best_r, E_r, centers_r, popt, pcov
-    """
+def hu_deconvolve_PL(x, y, r_values=None, rng=None, verbose=False):
     x = np.asarray(x)
     y = np.asarray(y)
     n = len(y)
@@ -258,26 +267,32 @@ def hu_deconvolve_PL(x, y, r_values=None, rng=None):
         rng = np.random.default_rng(0)
 
     if r_values is None:
-        # Minimal but reasonable range of MIS values
         r_values = np.arange(1, max(3, n // 20))
 
-    # Stage 1: estimate iteration count T_max
-    T_max = estimate_Tmax(y, rng=rng)
-    print(f"Estimated T_max = {T_max}")
+    T_max = estimate_Tmax(y, rng=rng, verbose=verbose)
+    if verbose:
+        print(f"[hu_deconvolve_PL] T_max={T_max}, r_values={list(r_values)}")
 
     E_r = {}
     centers_r = {}
 
     for r in r_values:
-        peak_idx = extract_peaks_for_r(y, T_max, r, rng=rng)
+        if verbose:
+            print(f"\n[hu_deconvolve_PL] === Processing r={r} ===")
+
+        peak_idx = extract_peaks_for_r(y, T_max, r, rng=rng, verbose=verbose)
         centers_idx = cluster_peak_indices(peak_idx, min_gap=r)
         centers_r[r] = centers_idx
 
+        if verbose:
+            print(f"[hu_deconvolve_PL] r={r}, clustered centers={centers_idx}")
+
         if len(centers_idx) == 0:
             E_r[r] = np.inf
+            if verbose:
+                print(f"[hu_deconvolve_PL] r={r}, no peaks found -> E_r=inf")
             continue
 
-        # Quick approximate error E(r) using a crude Gaussian sum
         width_guess = 0.1 * (x.max() - x.min())
         params0 = []
         for c_idx in centers_idx:
@@ -286,7 +301,11 @@ def hu_deconvolve_PL(x, y, r_values=None, rng=None):
             params0.extend([A0, mu, width_guess])
 
         f_guess = gaussian_sum(x, *params0)
-        E_r[r] = 0.5 * np.sum((f_guess - y) ** 2)
+        E = 0.5 * np.sum((f_guess - y) ** 2)
+        E_r[r] = E
+
+        if verbose:
+            print(f"[hu_deconvolve_PL] r={r}, approx E(r)={E:.4e}")
 
     # Choose best_r from E(r): look for low error before big jump
     rs = np.array(sorted(E_r.keys()))
@@ -316,7 +335,7 @@ def hu_deconvolve_PL(x, y, r_values=None, rng=None):
 # ==============================
 # RUN DECONVOLUTION
 # ==============================
-best_r, E_r, centers_r, popt, pcov = hu_deconvolve_PL(x, y)
+best_r, E_r, centers_r, popt, pcov = hu_deconvolve_PL(x, y, verbose=True)
 
 print("\nFinal fitted peaks (in physical units of", X_COLUMN, "):")
 n_peaks = len(popt) // 3
