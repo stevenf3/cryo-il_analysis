@@ -13,7 +13,8 @@ Y_COLUMN = "Counts"
 # ==============================
 # LOADING AND PRE-PROCESSING
 # ==============================
-df = pd.read_csv(FILE_PATH)
+df_raw = pd.read_csv(FILE_PATH)
+df = df_raw[df_raw['Energy_eV'] >= 2.6]
 
 if X_COLUMN not in df.columns or Y_COLUMN not in df.columns:
     raise ValueError(f"Columns {X_COLUMN!r} and {Y_COLUMN!r} must exist in the file.")
@@ -57,18 +58,18 @@ def compute_error_and_grads(y, A, sigma):
     """
     n_points = len(y)
     f = forward_model(A, sigma, n_points)
-    residual = f - y
+    residual = f - y #Hu equation (5)
 
     idx = np.arange(n_points)
     j = idx[:, None]
     i = idx[None, :]
 
     sigma_safe = sigma[None, :] + 1e-12
-    exponent = -0.5 * ((j - i) ** 2) / (sigma_safe ** 2)
+    exponent = -0.5 * ((j - i) ** 2) / (sigma_safe ** 2) #Hu equations (3, 4)
     G = np.exp(exponent)
 
     # dE/dA_i = sum_j residual(j) * exp(...)
-    dE_dA = (residual[:, None] * G).sum(axis=0)
+    dE_dA = (residual[:, None] * G).sum(axis=0) #Hu equation (6)
 
     # dE/dsigma_i = sum_j residual(j) * exp(...) * A_i * (j-i)^2 / sigma_i^3
     diff2 = (j - i) ** 2
@@ -101,7 +102,7 @@ def estimate_Tmax(y, E_max_factor=1e-4, p_A=0.1, p_sigma=0.1, alpha=0.3, max_ite
     while t < max_iter:
         E, dE_dA, dE_dsigma = compute_error_and_grads(y, A, sigma)
 
-        if verbose and t % 50 == 0:
+        if verbose and t % 10 == 0:
             print(f"[estimate_Tmax] Iter {t}: E = {E:.4e}, target = {E_max:.4e}")
         if E <= E_max:
             if verbose:
@@ -162,9 +163,11 @@ def extract_peaks_for_r(y, T_max, r,
         A = np.clip(A, 0, None)
         sigma = np.clip(sigma, 1e-3, n / 2)
 
-        kk1 = np.exp(-k1 * (1 - t / T_max1))
+        kk1 = np.exp(-k1 * (1 - t / T_max1)) #basically the radius, exp term shrinks radius over # of iterations
         kk2 = np.exp(-k2 * (1 - t / T_max1))
-        radius = int(max(1, r * kk1))
+        radius = int(max(1, r * kk1)) #basically kk1 but at least 1
+        if verbose and t % 5 == 0:
+            print(f"[extract_peaks_for_r] r={r}, t={t}, radius={radius}, kk1={kk1:.4f}")
 
         A_new = A.copy()
         for i in range(n):
@@ -176,6 +179,7 @@ def extract_peaks_for_r(y, T_max, r,
             else:
                 if A[i] < local_max * kk2:
                     A_new[i] = 0.0
+
         A = A_new
 
     peak_indices = np.where(A > 0)[0]
@@ -200,6 +204,8 @@ def cluster_peak_indices(indices, min_gap):
             clusters.append(current)
             current = [idx]
     clusters.append(current)
+    if len(clusters) != 0:
+        print("[cluster_peak_indices] clustered into", len(clusters), "peaks")
     centers = [int(np.mean(c)) for c in clusters]
     return centers
 
@@ -268,10 +274,11 @@ def hu_deconvolve_PL(x, y, r_values=None, rng=None, verbose=False):
 
     if r_values is None:
         r_values = np.arange(1, max(3, n // 20))
+        print(f"[hu_deconvolve_PL] using default r_values up to: {max(r_values)}")
 
     T_max = estimate_Tmax(y, rng=rng, verbose=verbose)
     if verbose:
-        print(f"[hu_deconvolve_PL] T_max={T_max}, r_values={list(r_values)}")
+        print(f"[hu_deconvolve_PL] T_max={T_max}, r_values={min(r_values)} to {max(r_values)}")
 
     E_r = {}
     centers_r = {}
@@ -365,7 +372,7 @@ for k in range(n_peaks):
 
 plt.xlabel(X_COLUMN)
 plt.ylabel("Normalized Counts")
-plt.legend()
+#plt.legend()
 plt.title("Gaussian Deconvolution of PL Spectrum")
 plt.tight_layout()
 plt.savefig("PL_spectrum_fit.png", dpi=300)
