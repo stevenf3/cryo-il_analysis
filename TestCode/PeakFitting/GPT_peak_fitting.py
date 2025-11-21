@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
+from scipy.fft import fft, ifft, rfft, rfftfreq
 
 # ==============================
 # USER SETTINGS
@@ -9,12 +10,13 @@ from scipy.optimize import curve_fit
 FILE_PATH = "./TestCode/PeakFitting/GaN_68K_200ms_Start.csv"  # <-- change this
 X_COLUMN = "Energy_eV"                 # or "Wavelength_nm"
 Y_COLUMN = "Counts"
-
+cutoff = 2.6
+PEAK_SHAPE = "pvoigt"  # "gaussian", "lorentzian", or "pvoigt"
 # ==============================
 # LOADING AND PRE-PROCESSING
 # ==============================
 df_raw = pd.read_csv(FILE_PATH)
-df = df_raw[df_raw['Energy_eV'] >= 2.6]
+df = df_raw[df_raw[X_COLUMN] >= cutoff]
 
 if X_COLUMN not in df.columns or Y_COLUMN not in df.columns:
     raise ValueError(f"Columns {X_COLUMN!r} and {Y_COLUMN!r} must exist in the file.")
@@ -31,6 +33,21 @@ y_raw = y_raw[order]
 y = y_raw - np.min(y_raw)
 if np.max(y) > 0:
     y = y / np.max(y)
+
+import numpy as np
+
+def gaussian(x, A, mu, sigma):
+    return A * np.exp(-(x - mu)**2 / (2 * sigma**2))
+
+def lorentzian(x, A, mu, gamma):
+    # gamma == HWHM
+    return A * (gamma**2 / ((x - mu)**2 + gamma**2))
+
+def pseudo_voigt(x, A, mu, sigma, eta):
+    # sigma = Gaussian sigma, eta = mixing parameter (0..1)
+    G = np.exp(-(x - mu)**2 / (2 * sigma**2))
+    L = (sigma**2 / ((x - mu)**2 + sigma**2))
+    return A * (eta * L + (1 - eta) * G)
 
 # ==============================
 # HU-STYLE GAUSSIAN BASIS FUNCTIONS
@@ -213,53 +230,75 @@ def cluster_peak_indices(indices, min_gap):
 # ==============================
 # STANDARD GAUSSIAN FITTING
 # ==============================
-def gaussian_sum(x, *params):
-    """
-    Sum of Gaussians in physical x-space:
-    params = [A1, mu1, sigma1, A2, mu2, sigma2, ...]
-    """
-    n_peaks = len(params) // 3
+def peak_sum(x, *params, shape="gaussian"):
     y = np.zeros_like(x)
-    for k in range(n_peaks):
-        A = params[3 * k]
-        mu = params[3 * k + 1]
-        sig = params[3 * k + 2]
-        y += A * np.exp(-(x - mu) ** 2 / (2 * sig ** 2))
+    
+    if shape == "gaussian":
+        n = len(params) // 3
+        for k in range(n):
+            A, mu, sig = params[3*k:3*k+3]
+            y += gaussian(x, A, mu, sig)
+    
+    elif shape == "lorentzian":
+        n = len(params) // 3
+        for k in range(n):
+            A, mu, gamma = params[3*k:3*k+3]
+            y += lorentzian(x, A, mu, gamma)
+    
+    elif shape == "pvoigt":
+        n = len(params) // 4
+        for k in range(n):
+            A, mu, sigma, eta = params[4*k:4*k+4]
+            y += pseudo_voigt(x, A, mu, sigma, eta)
+    
+    else:
+        raise ValueError("Unknown peak shape: " + shape)
+
     return y
 
 
-def refine_with_curve_fit(x, y, peak_centers_idx, amp_guess_factor=1.0, width_guess=None):
-    """
-    Use SciPy curve_fit to refine amplitudes, centers, and widths
-    based on detected peak centers (indices).
-    """
+
+def refine_with_curve_fit(x, y, peak_centers_idx, shape="gaussian"):
     x = np.asarray(x)
     y = np.asarray(y)
 
     centers_x = x[peak_centers_idx]
-    A0 = y[peak_centers_idx] * amp_guess_factor
-
-    if width_guess is None:
-        width_guess = 0.1 * (x.max() - x.min())
-
-    sig0 = np.full_like(A0, width_guess, dtype=float)
+    A0 = y[peak_centers_idx]
 
     p0 = []
-    bounds_lower = []
-    bounds_upper = []
+    lower = []
+    upper = []
 
-    for A_i, mu_i, sig_i in zip(A0, centers_x, sig0):
-        p0.extend([A_i, mu_i, sig_i])
-        bounds_lower.extend([0.0, x.min(), 0.0])
-        bounds_upper.extend([np.inf, x.max(), x.max() - x.min()])
+    if shape == "gaussian":
+        width_guess = 0.1 * (x.max() - x.min())
+        for A_i, mu_i in zip(A0, centers_x):
+            p0 += [A_i, mu_i, width_guess]
+            lower += [0, x.min(), 0]
+            upper += [np.inf, x.max(), x.max()-x.min()]
+
+    elif shape == "lorentzian":
+        gamma_guess = 0.05 * (x.max() - x.min())
+        for A_i, mu_i in zip(A0, centers_x):
+            p0 += [A_i, mu_i, gamma_guess]
+            lower += [0, x.min(), 0]
+            upper += [np.inf, x.max(), x.max()-x.min()]
+
+    elif shape == "pvoigt":
+        width_guess = 0.1 * (x.max() - x.min())
+        for A_i, mu_i in zip(A0, centers_x):
+            p0 += [A_i, mu_i, width_guess, 0.5]  # eta=0.5 init
+            lower += [0, x.min(), 0, 0]
+            upper += [np.inf, x.max(), x.max()-x.min(), 1]
+
+    else:
+        raise ValueError("Unknown peak shape: " + shape)
 
     popt, pcov = curve_fit(
-        gaussian_sum, x, y, p0=p0,
-        bounds=(bounds_lower, bounds_upper),
-        maxfev=20000
+        lambda xv, *p: peak_sum(xv, *p, shape=shape),
+        x, y, p0=p0, bounds=(lower, upper), maxfev=40000
     )
-    return popt, pcov
 
+    return popt, pcov
 
 # ==============================
 # WRAPPER: FULL HU-STYLE WORKFLOW
@@ -273,7 +312,7 @@ def hu_deconvolve_PL(x, y, r_values=None, rng=None, verbose=False):
         rng = np.random.default_rng(0)
 
     if r_values is None:
-        r_values = np.arange(1, max(3, n // 20))
+        r_values = np.arange(5, max(7, n // 5), 5)
         print(f"[hu_deconvolve_PL] using default r_values up to: {max(r_values)}")
 
     T_max = estimate_Tmax(y, rng=rng, verbose=verbose)
@@ -307,7 +346,7 @@ def hu_deconvolve_PL(x, y, r_values=None, rng=None, verbose=False):
             A0 = y[c_idx]
             params0.extend([A0, mu, width_guess])
 
-        f_guess = gaussian_sum(x, *params0)
+        f_guess = peak_sum(x, *params0, shape=PEAK_SHAPE)
         E = 0.5 * np.sum((f_guess - y) ** 2)
         E_r[r] = E
 
@@ -334,14 +373,38 @@ def hu_deconvolve_PL(x, y, r_values=None, rng=None, verbose=False):
     print(f"Selected best_r = {best_r}")
 
     centers_idx_best = centers_r[best_r]
-    popt, pcov = refine_with_curve_fit(x, y, centers_idx_best)
+    popt, pcov = refine_with_curve_fit(x, y, centers_idx_best, shape=PEAK_SHAPE)
 
     return best_r, E_r, centers_r, popt, pcov
+
+# Plot individual Gaussians
+def plot_components(ax, x, params, shape):
+    if shape == "gaussian":
+        n = len(params)//3
+        for k in range(n):
+            A, mu, sig = params[3*k:3*k+3]
+            comp = gaussian(x, A, mu, sig)
+            ax.plot(x, comp, "--", label=f"Peak {k+1}")
+
+    elif shape == "lorentzian":
+        n = len(params)//3
+        for k in range(n):
+            A, mu, gam = params[3*k:3*k+3]
+            comp = lorentzian(x, A, mu, gam)
+            ax.plot(x, comp, "--", label=f"Peak {k+1}")
+
+    elif shape == "pvoigt":
+        n = len(params)//4
+        for k in range(n):
+            A, mu, sig, eta = params[4*k:4*k+4]
+            comp = pseudo_voigt(x, A, mu, sig, eta)
+            ax.plot(x, comp, "--", label=f"Peak {k+1}")
 
 
 # ==============================
 # RUN DECONVOLUTION
 # ==============================
+
 best_r, E_r, centers_r, popt, pcov = hu_deconvolve_PL(x, y, verbose=True)
 
 print("\nFinal fitted peaks (in physical units of", X_COLUMN, "):")
@@ -355,20 +418,25 @@ for k in range(n_peaks):
 # ==============================
 # PLOTTING
 # ==============================
-y_fit = gaussian_sum(x, *popt)
+y_fit = peak_sum(x, *popt, shape=PEAK_SHAPE)
 residuals = y - y_fit
+n = len(residuals)
+i = np.arange(n)
+
+R = rfft(residuals)
+freqs = rfftfreq(n, d=1)
+
+k0 = np.argmax(np.abs(R[1:])) + 1
+f0 = freqs[k0]
+
+plt.figure(figsize=(8, 3))
+plt.plot(freqs, np.abs(R), label="FFT of Residuals")
 
 plt.figure(figsize=(8, 6))
 plt.plot(x, y, label="Data (normalized)", linewidth=1.5)
 plt.plot(x, y_fit, "--", label="Total fit", linewidth=1.5)
 
-# Plot individual Gaussians
-for k in range(n_peaks):
-    A = popt[3 * k]
-    mu = popt[3 * k + 1]
-    sig = popt[3 * k + 2]
-    comp = A * np.exp(-(x - mu) ** 2 / (2 * sig ** 2))
-    plt.plot(x, comp, ":", label=f"Peak {k+1}")
+plot_components(plt.gca(), x, popt, PEAK_SHAPE)
 
 plt.xlabel(X_COLUMN)
 plt.ylabel("Normalized Counts")
